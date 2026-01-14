@@ -14,7 +14,7 @@ use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_hir::{self as hir, CoroutineDesugaring, CoroutineKind};
 use rustc_infer::traits::{Obligation, PolyTraitObligation, SelectionError};
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
-use rustc_middle::ty::{self, SizedTraitKind, Ty, TypeVisitableExt, TypingMode, elaborate};
+use rustc_middle::ty::{self, SizedTraitKind, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode, elaborate};
 use rustc_middle::{bug, span_bug};
 use tracing::{debug, instrument, trace};
 
@@ -626,6 +626,12 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     return;
                 }
 
+                // Issue #151115: Filter impls that would require inferring
+                // inaccessible types from external crates.
+                if self.impl_infers_inaccessible_types(impl_def_id, impl_trait_header, obligation) {
+                    return;
+                }
+
                 self.infcx.probe(|_| {
                     if let Ok(_args) = self.match_impl(impl_def_id, impl_trait_header, obligation) {
                         candidates.vec.push(ImplCandidate(impl_def_id));
@@ -726,6 +732,204 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
         }
         false
+    }
+
+    /// Checks if matching this impl would require inferring types that are
+    /// inaccessible from the current crate.
+    ///
+    /// Issue #151115: Type inference should not pick private types from external
+    /// crates. This method returns `true` if the impl should be filtered because
+    /// it would introduce inaccessible types via inference.
+    ///
+    /// The key insight is that we only filter when:
+    /// 1. The impl is from an external crate
+    /// 2. The obligation has inference variables in type argument positions
+    /// 3. The impl's corresponding types have non-Public visibility
+    ///
+    /// This allows explicit use of re-exported types (e.g., `dep::PrivateMarker`)
+    /// while preventing inference from picking truly private types.
+    fn impl_infers_inaccessible_types(
+        &self,
+        impl_def_id: DefId,
+        impl_trait_header: ty::ImplTraitHeader<'tcx>,
+        obligation: &PolyTraitObligation<'tcx>,
+    ) -> bool {
+        // Local impls are always accessible
+        if impl_def_id.is_local() {
+            return false;
+        }
+
+        let impl_trait_ref = impl_trait_header.trait_ref.skip_binder();
+        let obligation_trait_ref = obligation.predicate.skip_binder().trait_ref;
+
+        // Check each type argument position
+        for (impl_arg, obl_arg) in
+            impl_trait_ref.args.iter().zip(obligation_trait_ref.args.iter())
+        {
+            // Only check type arguments
+            let (Some(impl_ty), Some(obl_ty)) = (impl_arg.as_type(), obl_arg.as_type()) else {
+                continue;
+            };
+
+            // If the obligation has an inference variable at this position,
+            // check if the impl's type is accessible
+            if obl_ty.is_ty_var() {
+                if self.type_has_inaccessible_component(impl_ty) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Checks if a type contains any ADT components that are inaccessible.
+    ///
+    /// A type is considered inaccessible if:
+    /// 1. It has `Visibility::Restricted` (e.g., `pub(crate)`, no `pub`), OR
+    /// 2. It has `Visibility::Public` but is not exported through any
+    ///    non-hidden public path from the crate root
+    ///
+    /// This handles the pattern where marker types are defined with `pub`
+    /// in private modules but never exported (or only via `#[doc(hidden)]`).
+    fn type_has_inaccessible_component(&self, ty: Ty<'tcx>) -> bool {
+        struct InaccessibleTypeVisitor<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            found_inaccessible: &'a mut bool,
+        }
+
+        impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for InaccessibleTypeVisitor<'_, 'tcx> {
+            type Result = ();
+
+            fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
+                if let ty::Adt(adt_def, _) = ty.kind() {
+                    let def_id = adt_def.did();
+
+                    // Skip local types - they're always accessible
+                    if def_id.is_local() {
+                        return ty.super_visit_with(self);
+                    }
+
+                    // Quick check: types with Restricted visibility are
+                    // definitely inaccessible from outside their crate
+                    let vis = self.tcx.visibility(def_id);
+                    if !matches!(vis, ty::Visibility::Public) {
+                        *self.found_inaccessible = true;
+                        return ty.super_visit_with(self);
+                    }
+
+                    // For types with Public visibility, check if there's a
+                    // non-hidden public export path from the crate root
+                    if !self.has_public_export_path(def_id) {
+                        *self.found_inaccessible = true;
+                    }
+                }
+                ty.super_visit_with(self)
+            }
+        }
+
+        impl<'tcx> InaccessibleTypeVisitor<'_, 'tcx> {
+            /// Checks if a type is accessible from outside its crate via a
+            /// non-doc-hidden public path.
+            ///
+            /// A type is accessible if either:
+            /// 1. It's defined in a fully public path (all ancestor modules are public), OR
+            /// 2. It has a non-doc-hidden re-export from somewhere accessible
+            fn has_public_export_path(&self, target: DefId) -> bool {
+                // Check if the type itself is doc_hidden
+                if self.tcx.is_doc_hidden(target) {
+                    return false;
+                }
+
+                // Check 1: Is the type defined in a fully public location?
+                if self.definition_path_is_public(target) {
+                    return true;
+                }
+
+                // Check 2: Is there a non-doc-hidden re-export?
+                // Search through the crate's exports to find non-hidden paths to this type
+                let crate_root = target.krate.as_def_id();
+                self.find_non_hidden_export(crate_root, target)
+            }
+
+            /// Check if the type's definition path is fully public.
+            /// This means the type and all its ancestor modules have public visibility.
+            fn definition_path_is_public(&self, target: DefId) -> bool {
+                let mut current = target;
+                loop {
+                    let vis = self.tcx.visibility(current);
+                    if !matches!(vis, ty::Visibility::Public) {
+                        return false;
+                    }
+
+                    let parent = self.tcx.parent(current);
+                    if parent.is_crate_root() {
+                        return true;
+                    }
+
+                    current = parent;
+                }
+            }
+
+            /// Recursively search for a non-doc-hidden re-export path to target.
+            fn find_non_hidden_export(&self, module: DefId, target: DefId) -> bool {
+                // Check if this module is doc_hidden
+                if self.tcx.is_doc_hidden(module) {
+                    return false;
+                }
+
+                for child in self.tcx.module_children(module).iter() {
+                    // Skip non-public items
+                    if !child.vis.is_public() {
+                        continue;
+                    }
+
+                    let Some(child_def_id) = child.res.opt_def_id() else {
+                        continue;
+                    };
+
+                    // Check if this child exports our target
+                    if child_def_id == target {
+                        // This is a re-export of our target.
+                        // Check if the re-export itself is doc_hidden.
+                        // If reexport_chain is empty, this is a direct definition (not a re-export),
+                        // but we already checked the definition path above.
+                        // If non-empty, check if any re-export in the chain is doc_hidden.
+                        if child.reexport_chain.is_empty() {
+                            // Direct definition - already checked via definition_path_is_public
+                            continue;
+                        }
+                        let is_hidden_export = child.reexport_chain.iter()
+                            .any(|r| r.id().is_some_and(|id| self.tcx.is_doc_hidden(id)));
+                        if !is_hidden_export {
+                            return true; // Found a non-hidden re-export!
+                        }
+                        // This re-export is hidden, continue searching for other paths
+                        continue;
+                    }
+
+                    // If this is a module, recursively search it
+                    if child.res.module_like_def_id().is_some() {
+                        // Check if the module export itself is hidden
+                        let is_hidden_module = !child.reexport_chain.is_empty() &&
+                            child.reexport_chain.iter()
+                                .any(|r| r.id().is_some_and(|id| self.tcx.is_doc_hidden(id)));
+                        if !is_hidden_module && self.find_non_hidden_export(child_def_id, target) {
+                            return true;
+                        }
+                    }
+                }
+
+                false
+            }
+        }
+
+        let mut found = false;
+        let mut visitor = InaccessibleTypeVisitor {
+            tcx: self.tcx(),
+            found_inaccessible: &mut found,
+        };
+        ty.visit_with(&mut visitor);
+        found
     }
 
     fn assemble_candidates_from_auto_impls(

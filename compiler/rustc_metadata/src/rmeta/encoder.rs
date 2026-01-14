@@ -951,12 +951,14 @@ fn should_encode_attrs(def_kind: DefKind) -> bool {
         // https://github.com/model-checking/kani and is not a performance
         // or maintenance issue for us.
         DefKind::Closure => true,
+        // Use items need attrs encoded for #[doc(hidden)] to work
+        // properly across crates. Issue #151115.
+        DefKind::Use => true,
         DefKind::SyntheticCoroutineBody => false,
         DefKind::TyParam
         | DefKind::ConstParam
         | DefKind::Ctor(..)
         | DefKind::ExternCrate
-        | DefKind::Use
         | DefKind::ForeignMod
         | DefKind::AnonConst
         | DefKind::InlineConst
